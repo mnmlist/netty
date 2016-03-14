@@ -61,9 +61,10 @@ public class HttpServerUpgradeHandler extends HttpObjectAggregator {
 
         /**
          * Adds any headers to the 101 Switching protocols response that are appropriate for this protocol.
+         * Returns {@code true} if an upgrade was done, {@code false} otherwise.
          */
-        void prepareUpgradeResponse(ChannelHandlerContext ctx, FullHttpRequest upgradeRequest,
-                                    FullHttpResponse upgradeResponse);
+        boolean prepareUpgradeResponse(ChannelHandlerContext ctx, FullHttpRequest upgradeRequest,
+                                    HttpHeaders upgradeHeaders);
 
         /**
          * Performs an HTTP protocol upgrade from the source codec. This method is responsible for
@@ -310,34 +311,35 @@ public class HttpServerUpgradeHandler extends HttpObjectAggregator {
         // Prepare and send the upgrade response. Wait for this write to complete before upgrading,
         // since we need the old codec in-place to properly encode the response.
         final FullHttpResponse upgradeResponse = createUpgradeResponse(upgradeProtocol);
-        upgradeCodec.prepareUpgradeResponse(ctx, request, upgradeResponse);
+        if (upgradeCodec.prepareUpgradeResponse(ctx, request, upgradeResponse.headers())) {
+            final UpgradeCodec finalUpgradeCodec = upgradeCodec;
+            ctx.writeAndFlush(upgradeResponse).addListener(new ChannelFutureListener() {
+                @Override
+                public void operationComplete(ChannelFuture future) throws Exception {
+                    try {
+                        if (future.isSuccess()) {
+                            // Perform the upgrade to the new protocol.
+                            sourceCodec.upgradeFrom(ctx);
+                            finalUpgradeCodec.upgradeTo(ctx, request, upgradeResponse);
 
-        final UpgradeCodec finalUpgradeCodec = upgradeCodec;
-        ctx.writeAndFlush(upgradeResponse).addListener(new ChannelFutureListener() {
-            @Override
-            public void operationComplete(ChannelFuture future) throws Exception {
-                try {
-                    if (future.isSuccess()) {
-                        // Perform the upgrade to the new protocol.
-                        sourceCodec.upgradeFrom(ctx);
-                        finalUpgradeCodec.upgradeTo(ctx, request, upgradeResponse);
+                            // Notify that the upgrade has occurred. Retain the event to offset
+                            // the release() in the finally block.
+                            ctx.fireUserEventTriggered(event.retain());
 
-                        // Notify that the upgrade has occurred. Retain the event to offset
-                        // the release() in the finally block.
-                        ctx.fireUserEventTriggered(event.retain());
-
-                        // Remove this handler from the pipeline.
-                        ctx.pipeline().remove(HttpServerUpgradeHandler.this);
-                    } else {
-                        future.channel().close();
+                            // Remove this handler from the pipeline.
+                            ctx.pipeline().remove(HttpServerUpgradeHandler.this);
+                        } else {
+                            future.channel().close();
+                        }
+                    } finally {
+                        // Release the event if the upgrade event wasn't fired.
+                        event.release();
                     }
-                } finally {
-                    // Release the event if the upgrade event wasn't fired.
-                    event.release();
                 }
-            }
-        });
-        return true;
+            });
+            return true;
+        }
+        return false;
     }
 
     /**
